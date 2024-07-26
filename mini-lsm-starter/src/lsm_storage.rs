@@ -17,7 +17,7 @@ use crate::compact::{
 };
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -278,8 +278,32 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let guard = self.state.read();
+        let snapshot = &guard;
+
+        // Search on the current memtable.
+        if let Some(value) = snapshot.memtable.get(key) {
+            if value.is_empty() {
+                // found tomestone, return key not exists
+                return Ok(None);
+            }
+            return Ok(Some(value));
+        }
+
+        // Search on immutable memtables.
+        for memtable in snapshot.imm_memtables.iter() {
+            if let Some(value) = memtable.get(key) {
+                if value.is_empty() {
+                    // found tomestone, return key not exists
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
+        // unimplemented!()
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +312,48 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
-    }
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        assert!(!value.is_empty(), "value cannot be empty");
+        assert!(!key.is_empty(), "key cannot be empty");
 
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, value)?;
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+    }
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            // the memtable could have already been frozen, check again to ensure we really need to freeze
+            if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
+    }
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        assert!(!key.is_empty(), "key cannot be empty");
+
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(key, b"")?;
+            size = guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+        // unimplemented!()
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +378,19 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        // unimplemented!()
+        let memtable_id = self.next_sst_id();
+        let memtable = Arc::new(MemTable::create(memtable_id));
+
+        let old_memtable;
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            old_memtable = std::mem::replace(&mut snapshot.memtable, memtable);
+            snapshot.imm_memtables.insert(0, old_memtable.clone());
+            *guard = Arc::new(snapshot);
+        }
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
